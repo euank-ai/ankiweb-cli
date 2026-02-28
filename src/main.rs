@@ -29,19 +29,37 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Add a note to a deck
+    /// Add a note to a deck.
+    ///
+    /// Fields can be specified as key=value pairs, or use --front/--back
+    /// for simple Basic notes.
+    ///
+    /// Examples:
+    ///   ankiweb-cli add-note --deck "Japanese" --front "猫" --back "cat"
+    ///   ankiweb-cli add-note --deck "Core2k" --notetype "Core 2000" \
+    ///     -f "Vocabulary-Kanji=人" -f "Vocabulary-Kana=ひと" \
+    ///     -f "Vocabulary-English=person"
     AddNote {
         /// Deck name (created if it doesn't exist)
         #[arg(long)]
         deck: String,
 
-        /// Front of the card
-        #[arg(long)]
-        front: String,
+        /// Note type / model name (default: "Basic")
+        #[arg(long, default_value = "Basic")]
+        notetype: String,
 
-        /// Back of the card
+        /// Front of the card (shorthand for Basic notes)
         #[arg(long)]
-        back: String,
+        front: Option<String>,
+
+        /// Back of the card (shorthand for Basic notes)
+        #[arg(long)]
+        back: Option<String>,
+
+        /// Field values as "FieldName=value" pairs. Repeatable.
+        /// Use this for note types with custom fields.
+        #[arg(short = 'f', long = "field", value_name = "NAME=VALUE")]
+        fields: Vec<String>,
 
         /// Space-separated tags
         #[arg(long, default_value = "")]
@@ -57,6 +75,9 @@ enum Commands {
 
     /// List all decks
     ListDecks,
+
+    /// List note types (models) and their fields
+    ListNotetypes,
 }
 
 #[derive(Deserialize, Default)]
@@ -106,6 +127,51 @@ fn resolve_sync_config(cli: &Cli) -> Result<SyncConfig> {
     })
 }
 
+/// Parse --field args and --front/--back into an ordered field list.
+fn resolve_fields(
+    front: &Option<String>,
+    back: &Option<String>,
+    field_args: &[String],
+    notetype: &str,
+    model_fields: &[String],
+) -> Result<Vec<String>> {
+    if !field_args.is_empty() {
+        // Build from -f args, matching against model field order
+        let mut values: Vec<String> = vec![String::new(); model_fields.len()];
+        for arg in field_args {
+            let (name, value) = arg
+                .split_once('=')
+                .context(format!("field must be NAME=VALUE, got: {arg}"))?;
+            let idx = model_fields
+                .iter()
+                .position(|f| f == name)
+                .context(format!(
+                    "field '{}' not found in notetype '{}'. Available fields: {}",
+                    name,
+                    notetype,
+                    model_fields.join(", ")
+                ))?;
+            values[idx] = value.to_string();
+        }
+        Ok(values)
+    } else if let (Some(f), Some(b)) = (front, back) {
+        // Simple front/back mode
+        if model_fields.len() < 2 {
+            anyhow::bail!(
+                "notetype '{}' has {} field(s), need at least 2 for --front/--back",
+                notetype,
+                model_fields.len()
+            );
+        }
+        let mut values = vec![String::new(); model_fields.len()];
+        values[0] = f.clone();
+        values[1] = b.clone();
+        Ok(values)
+    } else {
+        anyhow::bail!("provide either --front and --back, or -f FIELD=VALUE pairs")
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -121,8 +187,10 @@ async fn main() -> Result<()> {
     match &cli.command {
         Commands::AddNote {
             deck,
+            notetype,
             front,
             back,
+            fields,
             tags,
         } => {
             eprintln!("Downloading collection from AnkiWeb...");
@@ -133,10 +201,12 @@ async fn main() -> Result<()> {
             let conn = collection::open_collection(&data, &db_path)?;
 
             let deck_id = collection::find_or_create_deck(&conn, deck)?;
-            let model_id = collection::find_basic_model(&conn)?;
-            let note_id = collection::add_note(&conn, deck_id, model_id, front, back, tags)?;
+            let (model_id, model_fields) = collection::find_model_by_name(&conn, notetype)?;
 
-            // Close connection before reading file
+            let field_values = resolve_fields(front, back, fields, notetype, &model_fields)?;
+            let note_id =
+                collection::add_note_with_fields(&conn, deck_id, model_id, &field_values, tags)?;
+
             drop(conn);
 
             eprintln!("Uploading modified collection to AnkiWeb...");
@@ -169,6 +239,22 @@ async fn main() -> Result<()> {
 
             for (id, name) in &decks {
                 println!("{id}\t{name}");
+            }
+        }
+
+        Commands::ListNotetypes => {
+            eprintln!("Downloading collection from AnkiWeb...");
+            let data = sync::download_collection(&sync_config).await?;
+
+            let tmp = tempfile::NamedTempFile::new()?;
+            let conn = collection::open_collection(&data, tmp.path())?;
+            let notetypes = collection::list_notetypes(&conn)?;
+
+            for (id, name, fields) in &notetypes {
+                println!("{id}\t{name}");
+                for (i, field) in fields.iter().enumerate() {
+                    println!("  [{i}] {field}");
+                }
             }
         }
     }

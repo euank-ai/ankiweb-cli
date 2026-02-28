@@ -39,7 +39,6 @@ fn field_checksum(field: &str) -> i64 {
     hasher.update(stripped.as_bytes());
     let hash = hasher.finalize();
     let hex = format!("{:x}", hash);
-    // First 8 hex digits as u32
     let val = u32::from_str_radix(&hex[..8], 16).unwrap_or(0);
     val as i64
 }
@@ -53,19 +52,21 @@ fn random_guid() -> String {
         .collect()
 }
 
+fn has_table(conn: &Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",
+        [name],
+        |r| r.get::<_, i64>(0),
+    )
+    .map(|c| c > 0)
+    .unwrap_or(false)
+}
+
+// ── Decks ──────────────────────────────────────────────────────────
+
 /// List all decks in the collection. Returns Vec<(id, name)>.
 pub fn list_decks(conn: &Connection) -> Result<Vec<(i64, String)>> {
-    // Try new schema first (Anki 2.1.28+): separate `decks` table
-    let has_decks_table: bool = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='decks'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false);
-
-    if has_decks_table {
+    if has_table(conn, "decks") {
         let mut stmt = conn.prepare("SELECT id, name FROM decks")?;
         let decks = stmt
             .query_map([], |row| {
@@ -75,7 +76,6 @@ pub fn list_decks(conn: &Connection) -> Result<Vec<(i64, String)>> {
         return Ok(decks);
     }
 
-    // Legacy schema: decks JSON in col table
     let decks_json: String = conn.query_row("SELECT decks FROM col", [], |r| r.get(0))?;
     let decks: HashMap<String, Value> = serde_json::from_str(&decks_json)?;
     let mut result = Vec::new();
@@ -90,35 +90,20 @@ pub fn list_decks(conn: &Connection) -> Result<Vec<(i64, String)>> {
 
 /// Find or create a deck by name. Returns deck id.
 pub fn find_or_create_deck(conn: &Connection, name: &str) -> Result<i64> {
-    let has_decks_table: bool = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='decks'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false);
-
-    if has_decks_table {
-        // New schema
+    if has_table(conn, "decks") {
         let existing: Option<i64> = conn
-            .query_row("SELECT id FROM decks WHERE name = ?1", [name], |r| {
-                r.get(0)
-            })
+            .query_row("SELECT id FROM decks WHERE name = ?1", [name], |r| r.get(0))
             .ok();
         if let Some(id) = existing {
             return Ok(id);
         }
         let id = now_epoch_ms();
-        // Minimal deck blob — Anki stores protobuf in `common` and `kind` columns in newer versions
-        // but also accepts a simple JSON-like setup. Let's insert with empty blobs.
         conn.execute(
             "INSERT INTO decks (id, name, mtime_secs, usn, common, kind) VALUES (?1, ?2, ?3, -1, x'', x'')",
             rusqlite::params![id, name, now_epoch_secs()],
         )?;
         Ok(id)
     } else {
-        // Legacy schema
         let decks_json: String = conn.query_row("SELECT decks FROM col", [], |r| r.get(0))?;
         let mut decks: HashMap<String, Value> = serde_json::from_str(&decks_json)?;
 
@@ -130,77 +115,106 @@ pub fn find_or_create_deck(conn: &Connection, name: &str) -> Result<i64> {
 
         let id = now_epoch_ms();
         let deck = serde_json::json!({
-            "id": id,
-            "name": name,
-            "mod": now_epoch_secs(),
-            "usn": -1,
-            "lrnToday": [0, 0],
-            "revToday": [0, 0],
-            "newToday": [0, 0],
-            "timeToday": [0, 0],
-            "collapsed": false,
-            "browserCollapsed": false,
-            "desc": "",
-            "dyn": 0,
-            "conf": 1,
-            "extendNew": 0,
-            "extendRev": 0,
+            "id": id, "name": name, "mod": now_epoch_secs(), "usn": -1,
+            "lrnToday": [0, 0], "revToday": [0, 0], "newToday": [0, 0],
+            "timeToday": [0, 0], "collapsed": false, "browserCollapsed": false,
+            "desc": "", "dyn": 0, "conf": 1, "extendNew": 0, "extendRev": 0,
         });
         decks.insert(id.to_string(), deck);
-        let new_json = serde_json::to_string(&decks)?;
-        conn.execute("UPDATE col SET decks = ?1", [&new_json])?;
+        conn.execute("UPDATE col SET decks = ?1", [&serde_json::to_string(&decks)?])?;
         Ok(id)
     }
 }
 
-/// Find the "Basic" model/notetype id, or the first available one.
-pub fn find_basic_model(conn: &Connection) -> Result<i64> {
-    let has_notetypes_table: bool = conn
-        .query_row(
-            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='notetypes'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|c| c > 0)
-        .unwrap_or(false);
+// ── Notetypes / Models ─────────────────────────────────────────────
 
-    if has_notetypes_table {
-        // Try to find "Basic"
-        let basic: Option<i64> = conn
-            .query_row(
-                "SELECT id FROM notetypes WHERE name = 'Basic'",
-                [],
-                |r| r.get(0),
-            )
-            .ok();
-        if let Some(id) = basic {
-            return Ok(id);
+/// Extract ordered field names from a notetype.
+/// New schema: fields stored in protobuf `config` blob — but field names
+/// are also stored in a `fields` table.
+/// Legacy schema: JSON `flds` array in the models JSON.
+fn get_model_fields_new(conn: &Connection, model_id: i64) -> Result<Vec<String>> {
+    // New schema has a `fields` table
+    if has_table(conn, "fields") {
+        let mut stmt =
+            conn.prepare("SELECT name FROM fields WHERE ntid = ?1 ORDER BY ord")?;
+        let fields: Vec<String> = stmt
+            .query_map([model_id], |row| row.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if !fields.is_empty() {
+            return Ok(fields);
         }
-        // Fall back to first notetype
-        conn.query_row("SELECT id FROM notetypes ORDER BY id LIMIT 1", [], |r| {
-            r.get(0)
-        })
-        .context("no notetypes found")
-    } else {
-        // Legacy: models JSON in col table
-        let models_json: String = conn.query_row("SELECT models FROM col", [], |r| r.get(0))?;
-        let models: HashMap<String, Value> = serde_json::from_str(&models_json)?;
-
-        for (id_str, model) in &models {
-            if model["name"].as_str() == Some("Basic") {
-                return Ok(id_str.parse().unwrap_or(0));
-            }
-        }
-        // Fall back to first
-        models
-            .keys()
-            .next()
-            .and_then(|k| k.parse().ok())
-            .ok_or_else(|| anyhow!("no models found in collection"))
     }
+    Err(anyhow!("no fields found for notetype {model_id}"))
 }
 
-/// Get the next card `due` position for new cards in a deck.
+fn get_model_fields_legacy(model: &Value) -> Vec<String> {
+    model["flds"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|f| f["name"].as_str().unwrap_or("").to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// List all notetypes with their fields. Returns Vec<(id, name, fields)>.
+pub fn list_notetypes(conn: &Connection) -> Result<Vec<(i64, String, Vec<String>)>> {
+    if has_table(conn, "notetypes") {
+        let mut stmt = conn.prepare("SELECT id, name FROM notetypes ORDER BY name")?;
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut result = Vec::new();
+        for (id, name) in rows {
+            let fields = get_model_fields_new(conn, id).unwrap_or_default();
+            result.push((id, name, fields));
+        }
+        return Ok(result);
+    }
+
+    // Legacy
+    let models_json: String = conn.query_row("SELECT models FROM col", [], |r| r.get(0))?;
+    let models: HashMap<String, Value> = serde_json::from_str(&models_json)?;
+    let mut result = Vec::new();
+    for (id_str, model) in &models {
+        let id: i64 = id_str.parse().unwrap_or(0);
+        let name = model["name"].as_str().unwrap_or("").to_string();
+        let fields = get_model_fields_legacy(model);
+        result.push((id, name, fields));
+    }
+    result.sort_by(|a, b| a.1.cmp(&b.1));
+    Ok(result)
+}
+
+/// Find a model by name, returning (id, field_names).
+pub fn find_model_by_name(conn: &Connection, name: &str) -> Result<(i64, Vec<String>)> {
+    if has_table(conn, "notetypes") {
+        let id: i64 = conn
+            .query_row("SELECT id FROM notetypes WHERE name = ?1", [name], |r| {
+                r.get(0)
+            })
+            .context(format!("notetype '{}' not found", name))?;
+        let fields = get_model_fields_new(conn, id)?;
+        return Ok((id, fields));
+    }
+
+    // Legacy
+    let models_json: String = conn.query_row("SELECT models FROM col", [], |r| r.get(0))?;
+    let models: HashMap<String, Value> = serde_json::from_str(&models_json)?;
+    for (id_str, model) in &models {
+        if model["name"].as_str() == Some(name) {
+            let id: i64 = id_str.parse().unwrap_or(0);
+            let fields = get_model_fields_legacy(model);
+            return Ok((id, fields));
+        }
+    }
+    Err(anyhow!("notetype '{}' not found", name))
+}
+
+// ── Note/Card creation ─────────────────────────────────────────────
+
 fn next_due_position(conn: &Connection, deck_id: i64) -> i64 {
     conn.query_row(
         "SELECT COALESCE(MAX(due), 0) + 1 FROM cards WHERE did = ?1 AND type = 0",
@@ -210,19 +224,35 @@ fn next_due_position(conn: &Connection, deck_id: i64) -> i64 {
     .unwrap_or(0)
 }
 
-/// Add a note with Front/Back fields to a deck.
-pub fn add_note(
+/// Count how many card templates a notetype has (for generating multiple cards).
+fn card_template_count(conn: &Connection, model_id: i64) -> i64 {
+    if has_table(conn, "templates") {
+        conn.query_row(
+            "SELECT count(*) FROM templates WHERE ntid = ?1",
+            [model_id],
+            |r| r.get(0),
+        )
+        .unwrap_or(1)
+    } else {
+        // Legacy: count from models JSON
+        // For simplicity, default to 1
+        1
+    }
+}
+
+/// Add a note with arbitrary field values.
+/// `field_values` must be in the same order as the notetype's fields.
+pub fn add_note_with_fields(
     conn: &Connection,
     deck_id: i64,
     model_id: i64,
-    front: &str,
-    back: &str,
+    field_values: &[String],
     tags: &str,
 ) -> Result<i64> {
     let note_id = now_epoch_ms();
     let guid = random_guid();
-    let flds = format!("{}\x1f{}", front, back);
-    let sfld = front;
+    let flds = field_values.join("\x1f");
+    let sfld = field_values.first().map(|s| s.as_str()).unwrap_or("");
     let csum = field_checksum(sfld);
     let mod_time = now_epoch_secs();
 
@@ -232,15 +262,19 @@ pub fn add_note(
         rusqlite::params![note_id, guid, model_id, mod_time, tags, flds, sfld, csum],
     )?;
 
-    let card_id = note_id + 1;
-    let due = next_due_position(conn, deck_id);
+    // Create one card per template
+    let num_templates = card_template_count(conn, model_id);
+    for ord in 0..num_templates {
+        let card_id = note_id + 1 + ord;
+        let due = next_due_position(conn, deck_id);
 
-    conn.execute(
-        "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) \
-         VALUES (?1, ?2, ?3, 0, ?4, -1, 0, 0, ?5, 0, 0, 0, 0, 0, 0, 0, 0, '')",
-        rusqlite::params![card_id, note_id, deck_id, mod_time, due],
-    )?;
+        conn.execute(
+            "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) \
+             VALUES (?1, ?2, ?3, ?4, ?5, -1, 0, 0, ?6, 0, 0, 0, 0, 0, 0, 0, 0, '')",
+            rusqlite::params![card_id, note_id, deck_id, ord, mod_time, due],
+        )?;
+    }
 
-    tracing::info!(%note_id, %card_id, %deck_id, "added note and card");
+    tracing::info!(%note_id, %deck_id, templates = num_templates, "added note and card(s)");
     Ok(note_id)
 }
