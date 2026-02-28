@@ -94,14 +94,15 @@ ankiweb-cli backup --output my-backup.anki2
 
 ## How it works
 
-This tool communicates directly with AnkiWeb using Anki's sync protocol (v11). For `add-note`, it:
+This tool communicates directly with AnkiWeb using Anki's sync protocol (v11). It maintains a local collection cache at `~/.local/share/ankiweb-cli/collection.anki2` and uses incremental (normal) sync to stay in sync with the server.
 
-1. Downloads your full collection from AnkiWeb
-2. Opens the SQLite database
-3. Inserts the note and card(s) (one per card template in the note type)
-4. Uploads the modified collection back
+For `add-note`, it:
 
-**Important:** Make sure to sync any pending changes from your Anki clients before using `add-note`, as the upload replaces the server collection.
+1. Syncs incrementally with AnkiWeb (pulling any pending server changes)
+2. Adds the note and card(s) locally (one per card template in the note type)
+3. Syncs again to push the new note to AnkiWeb
+
+On first run, a full download is performed to initialize the local cache. Subsequent runs use incremental sync, making operations fast and safe to use alongside other Anki clients.
 
 ## License
 
