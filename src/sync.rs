@@ -171,14 +171,32 @@ async fn sync_request(
 }
 
 /// Established sync session with auth + endpoint resolved.
-struct SyncSession {
+pub struct SyncSession {
     client: reqwest::Client,
     hkey: String,
     session_key: String,
     endpoint: String,
+    /// Raw meta response data (JSON bytes).
+    pub meta_data: Vec<u8>,
 }
 
-async fn establish_session(config: &SyncConfig) -> Result<SyncSession> {
+impl SyncSession {
+    /// Make a sync request within this session.
+    pub async fn request(&self, method: &str, body: &[u8]) -> Result<Vec<u8>> {
+        let result = sync_request(
+            &self.client,
+            &self.endpoint,
+            method,
+            &self.hkey,
+            &self.session_key,
+            body,
+        )
+        .await?;
+        Ok(result.data)
+    }
+}
+
+pub async fn establish_session(config: &SyncConfig) -> Result<SyncSession> {
     let endpoint = config
         .endpoint
         .as_deref()
@@ -245,6 +263,7 @@ async fn establish_session(config: &SyncConfig) -> Result<SyncSession> {
         hkey,
         session_key,
         endpoint: resolved_endpoint,
+        meta_data: meta_result.data,
     })
 }
 

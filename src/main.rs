@@ -1,4 +1,5 @@
 mod collection;
+mod normal_sync;
 mod sync;
 
 use anyhow::{Context, Result};
@@ -234,27 +235,25 @@ async fn main() -> Result<()> {
             tags,
             due_in,
         } => {
-            eprintln!("Downloading collection from AnkiWeb...");
-            let data = sync::download_collection(&sync_config).await?;
-
-            let tmp = tempfile::NamedTempFile::new()?;
-            let db_path = tmp.path().to_path_buf();
-            let conn = collection::open_collection(&data, &db_path)?;
-
-            let deck_id = collection::find_or_create_deck(&conn, deck)?;
-            let (model_id, model_fields) = collection::find_model_by_name(&conn, notetype)?;
+            // We need to know the model fields to resolve --front/--back vs -f args.
+            // Ensure local collection exists first so we can look them up.
+            let collection_path = normal_sync::ensure_local_collection_path(&sync_config).await?;
+            let conn = collection::open_local(&collection_path)?;
+            let (_model_id, model_fields) = collection::find_model_by_name(&conn, notetype)?;
+            drop(conn);
 
             let field_values = resolve_fields(front, back, fields, notetype, &model_fields)?;
             let due_secs = due_in.as_deref().map(parse_duration).transpose()?;
-            let note_id = collection::add_note_with_fields(
-                &conn, deck_id, model_id, &field_values, tags, due_secs,
-            )?;
 
-            drop(conn);
-
-            eprintln!("Uploading modified collection to AnkiWeb...");
-            let modified = collection::read_collection(&db_path)?;
-            sync::upload_collection(&sync_config, &modified).await?;
+            let note_id = normal_sync::add_note_normal(
+                &sync_config,
+                deck,
+                notetype,
+                &field_values,
+                tags,
+                due_secs,
+            )
+            .await?;
 
             println!("Added note {note_id} to deck \"{deck}\"");
         }
@@ -273,26 +272,14 @@ async fn main() -> Result<()> {
         }
 
         Commands::ListDecks => {
-            eprintln!("Downloading collection from AnkiWeb...");
-            let data = sync::download_collection(&sync_config).await?;
-
-            let tmp = tempfile::NamedTempFile::new()?;
-            let conn = collection::open_collection(&data, tmp.path())?;
-            let decks = collection::list_decks(&conn)?;
-
+            let decks = normal_sync::list_decks_with_sync(&sync_config).await?;
             for (id, name) in &decks {
                 println!("{id}\t{name}");
             }
         }
 
         Commands::ListNotetypes => {
-            eprintln!("Downloading collection from AnkiWeb...");
-            let data = sync::download_collection(&sync_config).await?;
-
-            let tmp = tempfile::NamedTempFile::new()?;
-            let conn = collection::open_collection(&data, tmp.path())?;
-            let notetypes = collection::list_notetypes(&conn)?;
-
+            let notetypes = normal_sync::list_notetypes_with_sync(&sync_config).await?;
             for (id, name, fields) in &notetypes {
                 println!("{id}\t{name}");
                 for (i, field) in fields.iter().enumerate() {
