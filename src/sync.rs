@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 
 const SYNC_VERSION: u8 = 11;
 const DEFAULT_ENDPOINT: &str = "https://sync.ankiweb.net/";
-const CLIENT_VERSION: &str = "anki,25.02";
+const CLIENT_VERSION: &str = "anki,25.02 (dev),linux";
 
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
@@ -101,6 +101,7 @@ async fn sync_request(
     body: &[u8],
 ) -> Result<SyncRequestResult> {
     let url = format!("{}/sync/{}", endpoint.trim_end_matches('/'), method);
+    tracing::debug!(%url, %method, "sync_request");
 
     let header = SyncHeader {
         sync_version: SYNC_VERSION,
@@ -121,10 +122,12 @@ async fn sync_request(
         .await
         .with_context(|| format!("POST {url}"))?;
 
+    tracing::debug!(status = %resp.status(), "response");
     let (resp, new_endpoint) = if resp.status().is_redirection() {
         if let Some(location) = resp.headers().get("location").and_then(|v| v.to_str().ok()) {
             let new_base = location.trim_end_matches('/').to_string();
             let redirect_url = format!("{}/sync/{}", new_base, method);
+            tracing::debug!(%redirect_url, "following redirect");
             let resp = client
                 .post(&redirect_url)
                 .header("anki-sync", &serde_json::to_string(&header)?)
@@ -143,8 +146,18 @@ async fn sync_request(
 
     if !resp.status().is_success() {
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("sync {method} failed ({status}): {body}"));
+        let headers = format!("{:?}", resp.headers());
+        let body_bytes = resp.bytes().await.unwrap_or_default();
+        // Try to decompress if zstd
+        let body_text = if body_bytes.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+            zstd_decompress(&body_bytes)
+                .map(|b| String::from_utf8_lossy(&b).to_string())
+                .unwrap_or_else(|_| format!("{:?}", body_bytes))
+        } else {
+            String::from_utf8_lossy(&body_bytes).to_string()
+        };
+        tracing::error!(%status, %headers, %body_text, "sync request failed");
+        return Err(anyhow!("sync {method} failed ({status}): {body_text}"));
     }
 
     let resp_bytes = resp.bytes().await?;
@@ -184,9 +197,11 @@ async fn establish_session(config: &SyncConfig) -> Result<SyncSession> {
         password: config.password.clone(),
     };
     let body = serde_json::to_vec(&req)?;
+    tracing::debug!("logging in...");
     let result = sync_request(&client, &endpoint, "hostKey", "", &session_key, &body).await?;
     let resp: HostKeyResponse = serde_json::from_slice(&result.data)?;
     let hkey = resp.key;
+    tracing::debug!(%hkey, "login successful");
 
     // Meta
     let meta_req = MetaRequest {
@@ -199,6 +214,31 @@ async fn establish_session(config: &SyncConfig) -> Result<SyncSession> {
     let resolved_endpoint = meta_result
         .new_endpoint
         .unwrap_or_else(|| endpoint.clone());
+
+    // Parse meta response to check server message and continue flag
+    #[derive(Deserialize)]
+    struct Meta {
+        #[serde(rename = "cont", default)]
+        should_continue: bool,
+        #[serde(rename = "msg", default)]
+        server_message: String,
+        #[serde(default)]
+        empty: bool,
+    }
+    let meta: Meta = serde_json::from_slice(&meta_result.data)
+        .context("parsing meta response")?;
+    
+    if !meta.server_message.is_empty() {
+        tracing::warn!(msg = %meta.server_message, "AnkiWeb server message");
+    }
+    if !meta.should_continue {
+        let msg = if meta.server_message.is_empty() {
+            "server refused to continue sync".to_string()
+        } else {
+            meta.server_message.clone()
+        };
+        return Err(anyhow!("{msg}"));
+    }
 
     Ok(SyncSession {
         client,
