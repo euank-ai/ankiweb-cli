@@ -4,7 +4,7 @@ CLI tool for interacting with AnkiWeb directly — no Anki desktop or AnkiConnec
 
 ## Features
 
-- **Add notes** to any deck with arbitrary fields (supports complex note types like Core2k)
+- **Add notes** to any deck with arbitrary fields
 - **List decks** in your collection
 - **List note types** and their fields
 - **Backup** your full collection
