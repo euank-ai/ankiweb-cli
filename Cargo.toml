@@ -10,7 +10,7 @@ authors = ["claw <clawbot@euank.com>"]
 anyhow = "1.0"
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled", "collation"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha1 = "0.10"
@@ -22,4 +22,5 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 zstd = "0.13"
 dirs = "6"
+unicase = "2"
 chrono = "0.4"

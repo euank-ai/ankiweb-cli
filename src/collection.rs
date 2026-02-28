@@ -11,6 +11,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub fn open_collection(data: &[u8], path: &std::path::Path) -> Result<Connection> {
     std::fs::write(path, data)?;
     let conn = Connection::open(path)?;
+    // Register the custom `unicase` collation that Anki uses
+    conn.create_collation("unicase", |a, b| {
+        unicase::UniCase::new(a).cmp(&unicase::UniCase::new(b))
+    })?;
     Ok(conn)
 }
 
