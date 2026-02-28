@@ -246,12 +246,14 @@ fn card_template_count(conn: &Connection, model_id: i64) -> i64 {
 
 /// Add a note with arbitrary field values.
 /// `field_values` must be in the same order as the notetype's fields.
+/// `due_in_secs`: if Some, schedule as a review card due in this many seconds.
 pub fn add_note_with_fields(
     conn: &Connection,
     deck_id: i64,
     model_id: i64,
     field_values: &[String],
     tags: &str,
+    due_in_secs: Option<i64>,
 ) -> Result<i64> {
     let note_id = now_epoch_ms();
     let guid = random_guid();
@@ -270,12 +272,24 @@ pub fn add_note_with_fields(
     let num_templates = card_template_count(conn, model_id);
     for ord in 0..num_templates {
         let card_id = note_id + 1 + ord;
-        let due = next_due_position(conn, deck_id);
+
+        // type 0 = new, queue 0 = new, due = position
+        // type 2 = review, queue 2 = review, due = epoch day
+        let (card_type, queue, due, ivl, factor) = if let Some(secs) = due_in_secs {
+            let due_days = secs / 86400;
+            let today_epoch_day = mod_time / 86400;
+            let due_day = today_epoch_day + due_days.max(1);
+            // Review card: type=2, queue=2, due=epoch day, ivl=days, factor=2500 (default ease)
+            (2i64, 2i64, due_day, due_days.max(1), 2500i64)
+        } else {
+            let pos = next_due_position(conn, deck_id);
+            (0, 0, pos, 0, 0)
+        };
 
         conn.execute(
             "INSERT INTO cards (id, nid, did, ord, mod, usn, type, queue, due, ivl, factor, reps, lapses, left, odue, odid, flags, data) \
-             VALUES (?1, ?2, ?3, ?4, ?5, -1, 0, 0, ?6, 0, 0, 0, 0, 0, 0, 0, 0, '')",
-            rusqlite::params![card_id, note_id, deck_id, ord, mod_time, due],
+             VALUES (?1, ?2, ?3, ?4, ?5, -1, ?6, ?7, ?8, ?9, ?10, 0, 0, 0, 0, 0, 0, '')",
+            rusqlite::params![card_id, note_id, deck_id, ord, mod_time, card_type, queue, due, ivl, factor],
         )?;
     }
 

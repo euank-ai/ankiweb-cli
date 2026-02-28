@@ -64,6 +64,12 @@ enum Commands {
         /// Space-separated tags
         #[arg(long, default_value = "")]
         tags: String,
+
+        /// Make the card due for review after this duration.
+        /// Examples: "5m", "2h", "3d", "1w"
+        /// (minutes, hours, days, weeks)
+        #[arg(long)]
+        due_in: Option<String>,
     },
 
     /// Download a backup of the collection
@@ -172,6 +178,40 @@ fn resolve_fields(
     }
 }
 
+/// Parse a human-friendly duration string into seconds.
+/// Supports: 30s, 5m, 2h, 3d, 1w (and combinations like "1d12h")
+fn parse_duration(s: &str) -> Result<i64> {
+    let mut total: i64 = 0;
+    let mut num_buf = String::new();
+    for c in s.chars() {
+        if c.is_ascii_digit() {
+            num_buf.push(c);
+        } else {
+            let n: i64 = num_buf
+                .parse()
+                .context(format!("invalid duration: '{s}'"))?;
+            num_buf.clear();
+            let multiplier = match c {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86400,
+                'w' => 604800,
+                _ => anyhow::bail!("unknown duration unit '{c}' in '{s}' (use s/m/h/d/w)"),
+            };
+            total += n * multiplier;
+        }
+    }
+    if !num_buf.is_empty() {
+        // bare number defaults to seconds
+        total += num_buf.parse::<i64>().context("invalid duration")?;
+    }
+    if total == 0 {
+        anyhow::bail!("duration must be > 0");
+    }
+    Ok(total)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
@@ -192,6 +232,7 @@ async fn main() -> Result<()> {
             back,
             fields,
             tags,
+            due_in,
         } => {
             eprintln!("Downloading collection from AnkiWeb...");
             let data = sync::download_collection(&sync_config).await?;
@@ -204,8 +245,10 @@ async fn main() -> Result<()> {
             let (model_id, model_fields) = collection::find_model_by_name(&conn, notetype)?;
 
             let field_values = resolve_fields(front, back, fields, notetype, &model_fields)?;
-            let note_id =
-                collection::add_note_with_fields(&conn, deck_id, model_id, &field_values, tags)?;
+            let due_secs = due_in.as_deref().map(parse_duration).transpose()?;
+            let note_id = collection::add_note_with_fields(
+                &conn, deck_id, model_id, &field_values, tags, due_secs,
+            )?;
 
             drop(conn);
 
