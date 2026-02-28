@@ -659,7 +659,14 @@ pub async fn add_note_normal(
         let conn = open_local_collection(&collection_path)?;
         let deck_id = crate::collection::find_or_create_deck(&conn, deck)?;
         let (model_id, _fields) = crate::collection::find_model_by_name(&conn, notetype)?;
-        crate::collection::add_note_with_fields(&conn, deck_id, model_id, field_values, tags, due_in_secs)?
+        let nid = crate::collection::add_note_with_fields(&conn, deck_id, model_id, field_values, tags, due_in_secs)?;
+        // Update col.mod so sync detects local changes
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        conn.execute("UPDATE col SET mod = ?1", [now_ms])?;
+        nid
     };
 
     // Try normal sync
