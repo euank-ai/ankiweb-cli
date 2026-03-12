@@ -708,6 +708,19 @@ pub async fn list_notetypes_with_sync(config: &SyncConfig) -> Result<Vec<(i64, S
     crate::collection::list_notetypes(&conn)
 }
 
+/// Search for cards/notes by text (syncs first).
+pub async fn search(
+    config: &SyncConfig,
+    query: &str,
+    deck: Option<&str>,
+    limit: usize,
+) -> Result<Vec<crate::collection::SearchResult>> {
+    let collection_path = ensure_local_collection(config).await?;
+    do_normal_sync(config, &collection_path).await.ok();
+    let conn = open_local_collection(&collection_path)?;
+    crate::collection::search_cards(&conn, query, deck, limit)
+}
+
 /// Reschedule cards matching a query or note ID, then sync.
 pub async fn reschedule(
     config: &SyncConfig,

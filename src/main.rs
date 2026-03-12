@@ -102,6 +102,26 @@ enum Commands {
         due_in: String,
     },
 
+    /// Search for cards/notes by text.
+    ///
+    /// Searches note fields for the given text.
+    ///
+    /// Examples:
+    ///   ankiweb-cli search "猫"
+    ///   ankiweb-cli search "person" --deck "Japanese"
+    Search {
+        /// Text to search for (searches all note fields)
+        query: String,
+
+        /// Filter by deck name
+        #[arg(long)]
+        deck: Option<String>,
+
+        /// Maximum results to show
+        #[arg(long, default_value = "20")]
+        limit: usize,
+    },
+
     /// List all decks
     ListDecks,
 
@@ -303,6 +323,18 @@ async fn main() -> Result<()> {
             )
             .await?;
             println!("Rescheduled {count} card(s)");
+        }
+
+        Commands::Search { query, deck, limit } => {
+            let results = normal_sync::search(&sync_config, query, deck.as_deref(), *limit).await?;
+            if results.is_empty() {
+                println!("No results found.");
+            } else {
+                for r in &results {
+                    println!("note:{}\tdeck:{}\tdue:{}\ttype:{}\t{}",
+                        r.note_id, r.deck_name, r.due_display, r.card_type, r.fields_preview);
+                }
+            }
         }
 
         Commands::ListDecks => {

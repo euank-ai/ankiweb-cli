@@ -349,3 +349,116 @@ pub fn reschedule_cards(
     tracing::info!(count = card_ids.len(), due_day, "rescheduled cards");
     Ok(card_ids.len())
 }
+
+/// A search result entry.
+pub struct SearchResult {
+    pub note_id: i64,
+    pub deck_name: String,
+    pub card_type: String,
+    pub due_display: String,
+    pub fields_preview: String,
+}
+
+/// Search for cards/notes by text across all fields.
+pub fn search_cards(
+    conn: &Connection,
+    query: &str,
+    deck_filter: Option<&str>,
+    limit: usize,
+) -> Result<Vec<SearchResult>> {
+    let pattern = format!("%{query}%");
+
+    // Build deck name lookup
+    let decks = list_decks(conn)?;
+    let deck_map: std::collections::HashMap<i64, String> = decks.into_iter().collect();
+
+    // Filter deck ID if specified
+    let deck_id_filter: Option<i64> = deck_filter.and_then(|name| {
+        deck_map.iter().find(|(_, n)| n.as_str() == name).map(|(id, _)| *id)
+    });
+
+    let sql_with_deck =
+        "SELECT c.id, c.nid, c.did, c.type, c.queue, c.due, c.ivl, n.flds, n.sfld \
+         FROM cards c JOIN notes n ON c.nid = n.id \
+         WHERE c.did = ?2 AND n.flds LIKE ?1 \
+         ORDER BY n.mod DESC LIMIT ?3";
+    let sql_no_deck =
+        "SELECT c.id, c.nid, c.did, c.type, c.queue, c.due, c.ivl, n.flds, n.sfld \
+         FROM cards c JOIN notes n ON c.nid = n.id \
+         WHERE n.flds LIKE ?1 \
+         ORDER BY n.mod DESC LIMIT ?2";
+
+    let crt: i64 = conn.query_row("SELECT crt FROM col", [], |r| r.get(0)).unwrap_or(0);
+
+    let rows: Vec<SearchResult> = if let Some(did) = deck_id_filter {
+        let mut stmt = conn.prepare(sql_with_deck)?;
+        let mapped = stmt.query_map(rusqlite::params![pattern, did, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(1)?,  // nid
+                r.get::<_, i64>(2)?,  // did
+                r.get::<_, i64>(3)?,  // type
+                r.get::<_, i64>(5)?,  // due
+                r.get::<_, String>(7)?,  // flds
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .map(|(nid, did, ctype, due, flds)| to_search_result(nid, did, ctype, due, &flds, &deck_map, crt))
+        .collect();
+        mapped
+    } else {
+        let mut stmt = conn.prepare(sql_no_deck)?;
+        let mapped = stmt.query_map(rusqlite::params![pattern, limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(5)?,
+                r.get::<_, String>(7)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .map(|(nid, did, ctype, due, flds)| to_search_result(nid, did, ctype, due, &flds, &deck_map, crt))
+        .collect();
+        mapped
+    };
+
+    Ok(rows)
+}
+
+fn to_search_result(
+    nid: i64,
+    did: i64,
+    ctype: i64,
+    due: i64,
+    flds: &str,
+    deck_map: &std::collections::HashMap<i64, String>,
+    crt: i64,
+) -> SearchResult {
+    let deck_name = deck_map.get(&did).cloned().unwrap_or_else(|| did.to_string());
+    let card_type = match ctype {
+        0 => "new".to_string(),
+        1 => "learning".to_string(),
+        2 => "review".to_string(),
+        3 => "relearning".to_string(),
+        _ => format!("type:{ctype}"),
+    };
+    let due_display = if ctype == 0 {
+        format!("pos:{due}")
+    } else if ctype == 2 {
+        let due_epoch = crt + due * 86400;
+        let dt = chrono::DateTime::from_timestamp(due_epoch, 0)
+            .map(|d| d.format("%Y-%m-%d").to_string())
+            .unwrap_or_else(|| format!("day:{due}"));
+        dt
+    } else {
+        format!("{due}")
+    };
+    let fields: Vec<&str> = flds.split('\x1f').collect();
+    let preview = fields.iter().take(3).cloned().collect::<Vec<_>>().join(" | ");
+    let fields_preview = if preview.len() > 80 {
+        format!("{}…", &preview[..77])
+    } else {
+        preview
+    };
+    SearchResult { note_id: nid, deck_name, card_type, due_display, fields_preview }
+}
