@@ -281,9 +281,12 @@ pub fn add_note_with_fields(
         // type 2 = review, queue 2 = review, due = epoch day
         let (card_type, queue, due, ivl, factor) = if let Some(secs) = due_in_secs {
             let due_days = secs / 86400;
-            let today_epoch_day = mod_time / 86400;
-            let due_day = today_epoch_day + due_days.max(1);
-            // Review card: type=2, queue=2, due=epoch day, ivl=days, factor=2500 (default ease)
+            // Anki review card `due` = days since collection creation (col.crt)
+            let crt: i64 = conn.query_row("SELECT crt FROM col", [], |r| r.get(0))
+                .unwrap_or(mod_time);
+            let today_day = (mod_time - crt) / 86400;
+            let due_day = today_day + due_days.max(1);
+            // Review card: type=2, queue=2, due=days since crt, ivl=days, factor=2500 (default ease)
             (2i64, 2i64, due_day, due_days.max(1), 2500i64)
         } else {
             let pos = next_due_position(conn, deck_id);
