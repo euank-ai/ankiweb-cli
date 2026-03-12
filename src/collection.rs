@@ -303,3 +303,49 @@ pub fn add_note_with_fields(
     tracing::info!(%note_id, %deck_id, templates = num_templates, "added note and card(s)");
     Ok(note_id)
 }
+
+/// Reschedule cards matching a query or note ID.
+/// Sets them as review cards with the given due-in offset.
+/// Returns the number of cards updated.
+pub fn reschedule_cards(
+    conn: &Connection,
+    query: Option<&str>,
+    note_id: Option<i64>,
+    due_in_secs: i64,
+) -> Result<usize> {
+    let now = now_epoch_secs();
+    let crt: i64 = conn.query_row("SELECT crt FROM col", [], |r| r.get(0))
+        .unwrap_or(now);
+    let today_day = (now - crt) / 86400;
+    let due_days = (due_in_secs / 86400).max(1);
+    let due_day = today_day + due_days;
+
+    let card_ids: Vec<i64> = if let Some(nid) = note_id {
+        let mut stmt = conn.prepare("SELECT id FROM cards WHERE nid = ?1")?;
+        let ids: Vec<i64> = stmt.query_map([nid], |r| r.get(0))?.filter_map(|r| r.ok()).collect();
+        ids
+    } else if let Some(q) = query {
+        let pattern = format!("%{q}%");
+        let mut stmt = conn.prepare(
+            "SELECT c.id FROM cards c JOIN notes n ON c.nid = n.id WHERE n.sfld LIKE ?1"
+        )?;
+        let ids: Vec<i64> = stmt.query_map([&pattern], |r| r.get(0))?.filter_map(|r| r.ok()).collect();
+        ids
+    } else {
+        anyhow::bail!("must specify either --query or --note-id");
+    };
+
+    if card_ids.is_empty() {
+        anyhow::bail!("no cards found matching the criteria");
+    }
+
+    for cid in &card_ids {
+        conn.execute(
+            "UPDATE cards SET type = 2, queue = 2, due = ?1, ivl = ?2, factor = 2500, mod = ?3, usn = -1 WHERE id = ?4",
+            rusqlite::params![due_day, due_days, now, cid],
+        )?;
+    }
+
+    tracing::info!(count = card_ids.len(), due_day, "rescheduled cards");
+    Ok(card_ids.len())
+}

@@ -707,3 +707,46 @@ pub async fn list_notetypes_with_sync(config: &SyncConfig) -> Result<Vec<(i64, S
     let conn = open_local_collection(&collection_path)?;
     crate::collection::list_notetypes(&conn)
 }
+
+/// Reschedule cards matching a query or note ID, then sync.
+pub async fn reschedule(
+    config: &SyncConfig,
+    query: Option<&str>,
+    note_id: Option<i64>,
+    due_in_secs: i64,
+) -> Result<usize> {
+    let collection_path = ensure_local_collection(config).await?;
+
+    // Sync first to get latest state
+    do_normal_sync(config, &collection_path).await.ok();
+
+    let count = {
+        let conn = open_local_collection(&collection_path)?;
+        let count = crate::collection::reschedule_cards(&conn, query, note_id, due_in_secs)?;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        conn.execute("UPDATE col SET mod = ?1", [now_ms])?;
+        count
+    };
+
+    // Push changes
+    match do_normal_sync(config, &collection_path).await {
+        Ok(true) => eprintln!("Changes synced successfully."),
+        Ok(false) => {
+            eprintln!("Normal sync not possible, falling back to full upload...");
+            let data = crate::collection::read_collection(&collection_path)?;
+            crate::sync::upload_collection(config, &data).await?;
+            eprintln!("Uploaded via full sync.");
+        }
+        Err(e) => {
+            eprintln!("Normal sync failed: {e}. Falling back to full upload...");
+            let data = crate::collection::read_collection(&collection_path)?;
+            crate::sync::upload_collection(config, &data).await?;
+            eprintln!("Uploaded via full sync.");
+        }
+    }
+
+    Ok(count)
+}

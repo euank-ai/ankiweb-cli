@@ -80,6 +80,28 @@ enum Commands {
         output: Option<PathBuf>,
     },
 
+    /// Reschedule an existing card by setting a new due date.
+    ///
+    /// Find cards by note content (searches the sort field).
+    ///
+    /// Examples:
+    ///   ankiweb-cli reschedule --query "猫" --due-in "3d"
+    ///   ankiweb-cli reschedule --note-id 1234567890 --due-in "1w"
+    Reschedule {
+        /// Search for cards whose note sort field contains this text
+        #[arg(long, group = "target")]
+        query: Option<String>,
+
+        /// Target a specific note by ID
+        #[arg(long, group = "target")]
+        note_id: Option<i64>,
+
+        /// New due date as a duration from now.
+        /// Examples: "5m", "2h", "3d", "1w"
+        #[arg(long)]
+        due_in: String,
+    },
+
     /// List all decks
     ListDecks,
 
@@ -269,6 +291,18 @@ async fn main() -> Result<()> {
 
             std::fs::write(&path, &data)?;
             println!("Saved {} bytes to {}", data.len(), path.display());
+        }
+
+        Commands::Reschedule { query, note_id, due_in } => {
+            let due_secs = parse_duration(due_in)?;
+            let count = normal_sync::reschedule(
+                &sync_config,
+                query.as_deref(),
+                *note_id,
+                due_secs,
+            )
+            .await?;
+            println!("Rescheduled {count} card(s)");
         }
 
         Commands::ListDecks => {
