@@ -410,6 +410,41 @@ fn open_local_collection(path: &Path) -> Result<Connection> {
     crate::collection::open_local(path)
 }
 
+async fn replace_local_collection_from_server(
+    config: &SyncConfig,
+    collection_path: &Path,
+) -> Result<()> {
+    let data = sync::download_collection(config).await?;
+    std::fs::write(collection_path, &data)?;
+    let conn = open_local_collection(collection_path)?;
+    mark_downloaded(&conn)?;
+    Ok(())
+}
+
+async fn upload_collection_and_refresh(
+    config: &SyncConfig,
+    collection_path: &Path,
+) -> Result<()> {
+    let data = crate::collection::read_collection(collection_path)?;
+    sync::upload_collection(config, &data).await?;
+    replace_local_collection_from_server(config, collection_path).await?;
+    Ok(())
+}
+
+async fn sync_for_read_only(config: &SyncConfig, collection_path: &Path) -> Result<()> {
+    match do_normal_sync(config, collection_path).await {
+        Ok(true) => Ok(()),
+        Ok(false) => {
+            eprintln!("Normal sync not possible, downloading latest collection...");
+            replace_local_collection_from_server(config, collection_path).await
+        }
+        Err(e) => {
+            eprintln!("Normal sync failed: {e}");
+            Ok(())
+        }
+    }
+}
+
 /// Ensure a local collection exists. Returns the path.
 pub async fn ensure_local_collection_path(config: &SyncConfig) -> Result<PathBuf> {
     ensure_local_collection(config).await
@@ -684,9 +719,9 @@ pub async fn add_note_normal(
     }
 
     // Fallback: full upload
-    let data = crate::collection::read_collection(&collection_path)?;
-    sync::upload_collection(config, &data).await?;
+    upload_collection_and_refresh(config, &collection_path).await?;
     eprintln!("Uploaded via full sync.");
+    eprintln!("Refreshed local collection after full sync.");
 
     Ok(note_id)
 }
@@ -695,7 +730,7 @@ pub async fn add_note_normal(
 pub async fn list_decks_with_sync(config: &SyncConfig) -> Result<Vec<(i64, String)>> {
     let collection_path = ensure_local_collection(config).await?;
     // Pull latest changes
-    do_normal_sync(config, &collection_path).await.ok();
+    sync_for_read_only(config, &collection_path).await?;
     let conn = open_local_collection(&collection_path)?;
     crate::collection::list_decks(&conn)
 }
@@ -703,7 +738,7 @@ pub async fn list_decks_with_sync(config: &SyncConfig) -> Result<Vec<(i64, Strin
 /// List notetypes using local collection (syncs first if needed).
 pub async fn list_notetypes_with_sync(config: &SyncConfig) -> Result<Vec<(i64, String, Vec<String>)>> {
     let collection_path = ensure_local_collection(config).await?;
-    do_normal_sync(config, &collection_path).await.ok();
+    sync_for_read_only(config, &collection_path).await?;
     let conn = open_local_collection(&collection_path)?;
     crate::collection::list_notetypes(&conn)
 }
@@ -716,7 +751,7 @@ pub async fn search(
     limit: usize,
 ) -> Result<Vec<crate::collection::SearchResult>> {
     let collection_path = ensure_local_collection(config).await?;
-    do_normal_sync(config, &collection_path).await.ok();
+    sync_for_read_only(config, &collection_path).await?;
     let conn = open_local_collection(&collection_path)?;
     crate::collection::search_cards(&conn, query, deck, limit)
 }
@@ -731,7 +766,7 @@ pub async fn reschedule(
     let collection_path = ensure_local_collection(config).await?;
 
     // Sync first to get latest state
-    do_normal_sync(config, &collection_path).await.ok();
+    sync_for_read_only(config, &collection_path).await?;
 
     let count = {
         let conn = open_local_collection(&collection_path)?;
@@ -749,15 +784,15 @@ pub async fn reschedule(
         Ok(true) => eprintln!("Changes synced successfully."),
         Ok(false) => {
             eprintln!("Normal sync not possible, falling back to full upload...");
-            let data = crate::collection::read_collection(&collection_path)?;
-            crate::sync::upload_collection(config, &data).await?;
+            upload_collection_and_refresh(config, &collection_path).await?;
             eprintln!("Uploaded via full sync.");
+            eprintln!("Refreshed local collection after full sync.");
         }
         Err(e) => {
             eprintln!("Normal sync failed: {e}. Falling back to full upload...");
-            let data = crate::collection::read_collection(&collection_path)?;
-            crate::sync::upload_collection(config, &data).await?;
+            upload_collection_and_refresh(config, &collection_path).await?;
             eprintln!("Uploaded via full sync.");
+            eprintln!("Refreshed local collection after full sync.");
         }
     }
 
